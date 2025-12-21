@@ -3,8 +3,8 @@ use std::{io, path::PathBuf};
 use tokio::time::{self, Duration, sleep};
 
 use spider_client::{
-    message::{Message, UiElement, UiElementKind, UiMessage, UiPageManager, UiPath},
-    AddressStrategy, Relation, Role, SpiderClient, SpiderId2048,
+    
+    link::{Relation, Role, SpiderId2048, message::{Message, UiElement, UiElementKind, UiMessage, UiPageManager, UiPath},}, SpiderClientBuilder, ClientChannel, ClientResponse,
 };
 
 use rppal::i2c::I2c;
@@ -21,8 +21,8 @@ struct State {
 }
 
 impl State {
-    async fn init(client: &mut SpiderClient) -> Self {
-        let id = client.self_relation().id;
+    async fn init(client: &mut ClientChannel) -> Self {
+        let id = client.id().clone();
         let mut test_page = UiPageManager::new(id, "Probe");
         let mut root = test_page
             .get_element_mut(&UiPath::root())
@@ -52,35 +52,20 @@ impl State {
 async fn main() -> Result<(), io::Error> {
     println!("Hello, world!");
 
+
+
     let client_path = PathBuf::from("client_state.dat");
-    let mut client = if client_path.exists() {
-        SpiderClient::from_file(&client_path)
-    } else {
-        let mut client = SpiderClient::new();
-        client.set_state_path(&client_path);
-        client.add_strat(AddressStrategy::Addr(String::from("192.168.0.10:1930")));
-        client.save();
-        client
-    };
 
-    if !client.has_host_relation() {
-        let path = PathBuf::from("spider_keyfile.json");
+    let mut builder = SpiderClientBuilder::load_or_set(&client_path, |builder| {
+        builder.enable_beacon(true);
+    }).await.expect("Failed to load config");
 
-        let data = match std::fs::read_to_string(&path) {
-            Ok(str) => str,
-            Err(_) => String::from("[]"),
-        };
-        let id: SpiderId2048 = serde_json::from_str(&data).expect("Failed to deserialize spiderid");
-        let host = Relation {
-            id,
-            role: Role::Peer,
-        };
-        client.set_host_relation(host);
-        client.save();
-    }
+    builder.try_use_keyfile("spider_keyfile.json").await;
 
-    client.connect().await;
-    let mut state = State::init(&mut client).await;
+    let mut client_channel = builder.start(true).await.expect("failed to start");
+
+
+    let mut state = State::init(&mut client_channel).await;
     let mut i2c = I2c::new().unwrap();
     i2c.set_slave_address(PROBE_ADDR);
 
@@ -89,10 +74,11 @@ async fn main() -> Result<(), io::Error> {
 
         tokio::select!{
             // respond to base
-            msg = client.recv() => {
+            msg = client_channel.recv() => {
                 match msg {
-                    Some(msg) => msg_handler(&mut client, &mut state, msg).await,
-                    None => break, //  done! (Maybe retry connection)
+                    Ok(ClientResponse::Message(msg, _epoch)) => msg_handler(&mut client_channel, &mut state, msg).await,
+                    Err(_e) => break, //  Client has failed in some way, exit
+                    _ => {} // ignore other messages, since simple probe only returns data
                 }
             },
             // Take probe reading
@@ -105,7 +91,7 @@ async fn main() -> Result<(), io::Error> {
                 drop(element);
                 let changes = state.test_page.get_changes();
                 let msg = Message::Ui(UiMessage::UpdateElements(changes));
-                client.send(msg).await;
+                client_channel.send(msg).await;
             }
         }
     }
@@ -114,12 +100,13 @@ async fn main() -> Result<(), io::Error> {
 }
 
 // Do nothing, since this probe only sends messages
-async fn msg_handler(client: &mut SpiderClient, state: &mut State, msg: Message) {
+async fn msg_handler(client: &mut ClientChannel, state: &mut State, msg: Message) {
     match msg {
-        Message::Peripheral(_) => {}
-        Message::Ui(_) => {},
-        Message::Dataset(_) => {}
-        Message::Event(_) => {}
+        Message::Ui(_msg) => {},
+        Message::Dataset(_msg) => {},
+        Message::Router(_msg) => {},
+        Message::Group(_msg) => {},
+        Message::Error(_msg) => {},
     }
 }
 
@@ -129,7 +116,7 @@ async fn get_temp(i2c: &mut I2c) -> f32{
     i2c.block_write(TEMP_ADDR, &mut reg).expect("write to succeed");
     sleep(Duration::from_millis(100)).await;
     let mut reg = [0u8; 4];
-    let data = i2c.block_read(TEMP_ADDR, &mut reg).expect("read to succeed");
+    let _data = i2c.block_read(TEMP_ADDR, &mut reg).expect("read to succeed");
     println!("bytes: {:?}", reg);
     let temp = i32::from_be_bytes(reg);
     let mut temp = temp as f32;
