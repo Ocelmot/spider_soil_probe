@@ -1,58 +1,24 @@
-use std::{io, path::PathBuf};
 
-use tokio::time::{self, Duration, sleep};
 
-use spider_client::{
-    
-    link::{Relation, Role, SpiderId2048, message::{Message, UiElement, UiElementKind, UiMessage, UiPageManager, UiPath},}, SpiderClientBuilder, ClientChannel, ClientResponse,
-};
+mod rpi_interface;
+use rpi_interface::INPUT_BUTTON_PIN;
 
-use rppal::i2c::I2c;
+mod state;
+use state::State;
 
-const PROBE_ADDR: u16 = 0x36;
+mod ui;
 
-const TEMP_ADDR: u8 = 0x00;
-const TEMP_SIZE: usize = 4;
-const WATER_ADDR: u8 = 0x0f;
-const WATER_SIZE: usize = 2;
+use std::{io, path::PathBuf, time::Duration};
+use tokio::time::interval;
+use spider_client::{SpiderClientBuilder, ClientResponse, link::message::{Message, UiMessage, UiInput, DatasetPath, DatasetMessage, DatasetData}};
+use rppal::gpio::Trigger;
 
-struct State {
-    pub test_page: UiPageManager,
-}
-
-impl State {
-    async fn init(client: &mut ClientChannel) -> Self {
-        let id = client.id().clone();
-        let mut test_page = UiPageManager::new(id, "Probe");
-        let mut root = test_page
-            .get_element_mut(&UiPath::root())
-            .expect("all pages have a root");
-        root.set_kind(UiElementKind::Rows);
-        root.append_child(UiElement::from_string("Temp is: "));
-        root.append_child({
-            let mut element = UiElement::from_string("-");
-            element.set_id("temp");
-            element
-        });
-        
-        drop(root);
-
-        test_page.get_changes(); // clear changes to synch, since we are going to send the whole page at first. This
-                                 // Could instead set the initial elements with raw and then recalculate ids
-        let msg = Message::Ui(UiMessage::SetPage(test_page.get_page().clone()));
-        client.send(msg).await;
-
-        Self {
-            test_page,
-        }
-    }
-}
+const TICK_INTERVAL: Duration = Duration::from_secs(10);
+const LONG_PRESS_THRESHOLD: Duration = Duration::from_secs(4);
 
 #[tokio::main]
 async fn main() -> Result<(), io::Error> {
     println!("Hello, world!");
-
-
 
     let client_path = PathBuf::from("client_state.dat");
 
@@ -63,35 +29,61 @@ async fn main() -> Result<(), io::Error> {
     builder.try_use_keyfile("spider_keyfile.json").await;
 
     let mut client_channel = builder.start(true).await.expect("failed to start");
+    let client_sender = client_channel.clone();
 
+    let mut state = State::init(client_sender).await;
+    
 
-    let mut state = State::init(&mut client_channel).await;
-    let mut i2c = I2c::new().unwrap();
-    i2c.set_slave_address(PROBE_ADDR);
-
-    let mut interval = time::interval(Duration::from_secs(10));
+    let mut interval = interval(Duration::from_secs(1));
     loop {
-
         tokio::select!{
             // respond to base
             msg = client_channel.recv() => {
+                println!("Got message: {:?}", msg);
                 match msg {
-                    Ok(ClientResponse::Message(msg, _epoch)) => msg_handler(&mut client_channel, &mut state, msg).await,
+                    Ok(ClientResponse::Connected(_epoch)) => {
+                        // println!("Connected!");
+                        state.on_connect().await;
+                    }
+                    Ok(ClientResponse::Message(Message::Ui(UiMessage::Input(element_id, dataset_ids, change)), _epoch)) => handle_input(&mut state, element_id, dataset_ids, change).await,
+                    Ok(ClientResponse::Message(Message::Dataset(DatasetMessage::Dataset{path, data}), _epoch)) => handle_dataset(&mut state, path, data).await,
+                    Ok(_response) => {
+                        // println!("got response: {:?}", response);
+                    }
                     Err(_e) => break, //  Client has failed in some way, exit
-                    _ => {} // ignore other messages, since simple probe only returns data
                 }
             },
             // Take probe reading
-            x = interval.tick() => {
-                let t = get_temp(&mut i2c).await;
-                println!("Temp: {}", t);
-                let mut element = state.test_page.get_by_id_mut("temp").expect("Page should have temp element");
-                element.set_text(format!("{}C", t));
-
-                drop(element);
-                let changes = state.test_page.get_changes();
-                let msg = Message::Ui(UiMessage::UpdateElements(changes));
-                client_channel.send(msg).await;
+            _ = interval.tick() => {
+                println!("period: {:?}", interval.period());
+                state.update_page_clock_time();
+                state.update_page_temp().await;
+                state.update_page_water().await;
+                state.decrement_time(interval.period());
+                state.update_page_timer();
+                state.update_ui().await;
+            },
+            // Respond when the pins change their state
+            pin_event = state.get_pin_event() => {
+                let (pin, trigger) = pin_event.expect("Event channel closed");
+                println!("pin: {:?}, trigger: {:?}", pin, trigger);
+                if pin == INPUT_BUTTON_PIN  && trigger == Trigger::FallingEdge{
+                    state.start_press();
+                }
+                if pin == INPUT_BUTTON_PIN  && trigger == Trigger::RisingEdge{
+                    // if timer was over the hold limit
+                    if state.time_since_press() > LONG_PRESS_THRESHOLD {
+                        println!("Resetting time");
+                        state.clear_time();
+                        state.update_page_timer();
+                        state.update_ui().await;
+                    }else{
+                        println!("Incrementing time");
+                        state.increment_time(Duration::from_secs(10));
+                        state.update_page_timer();
+                        state.update_ui().await;
+                    }
+                }
             }
         }
     }
@@ -99,27 +91,60 @@ async fn main() -> Result<(), io::Error> {
     Ok(())
 }
 
-// Do nothing, since this probe only sends messages
-async fn msg_handler(client: &mut ClientChannel, state: &mut State, msg: Message) {
-    match msg {
-        Message::Ui(_msg) => {},
-        Message::Dataset(_msg) => {},
-        Message::Router(_msg) => {},
-        Message::Group(_msg) => {},
-        Message::Error(_msg) => {},
+async fn handle_input(state: &mut State, element_id: String, _dataset_ids: Vec<usize>, _change: UiInput){
+    match element_id.as_str() {
+        "inc_5_min" => {
+            state.increment_time(Duration::from_mins(5));
+            state.update_page_timer();
+            state.update_ui().await;
+        }
+        "inc_10_min" => {
+            state.increment_time(Duration::from_mins(10));
+            state.update_page_timer();
+            state.update_ui().await;
+        }
+        "inc_1_day" => {
+            state.increment_time(Duration::from_hours(24));
+            state.update_page_timer();
+            state.update_ui().await;
+        }
+        "clear_timer" => {
+            state.clear_time();
+            state.update_page_timer();
+            state.update_ui().await;
+        }
+
+        "toggle_pwr_led" => {
+            let mut pwr_led = state.is_enable_pwr_led();
+            pwr_led = !pwr_led;
+            println!("Toggling power LED: new_value: {}", pwr_led);
+            state.set_enable_pwr_led(pwr_led).await;
+            state.save_config().await;
+        }
+
+        "toggle_temp_unit" => {
+            let mut is_c = state.is_units_c();
+            is_c = !is_c;
+            println!("Toggling unit: new_value: {}", is_c);
+            state.set_units_c(is_c).await;
+            state.save_config().await;
+        }
+
+        "toggle_button_led" => {
+            let mut pwr_led = state.is_enable_button_led();
+            pwr_led = !pwr_led;
+            println!("Toggling button LED: new_value: {}", pwr_led);
+            state.set_enable_button_led(pwr_led).await;
+            state.save_config().await;
+        }
+
+        _ => {} // Unknown input?
     }
 }
 
-
-async fn get_temp(i2c: &mut I2c) -> f32{
-    let mut reg = [0x04];
-    i2c.block_write(TEMP_ADDR, &mut reg).expect("write to succeed");
-    sleep(Duration::from_millis(100)).await;
-    let mut reg = [0u8; 4];
-    let _data = i2c.block_read(TEMP_ADDR, &mut reg).expect("read to succeed");
-    println!("bytes: {:?}", reg);
-    let temp = i32::from_be_bytes(reg);
-    let mut temp = temp as f32;
-    temp = temp * 0.00001525878;
-    temp
+async fn handle_dataset(state: &mut State, _path: DatasetPath, data: Vec<DatasetData>){
+    if let Some(DatasetData::Map(map)) = data.into_iter().nth(0){
+        // use saved config
+        state.set_config(map).await;
+    }
 }
