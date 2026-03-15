@@ -5,12 +5,16 @@ use crate::ui::init_ui;
 use std::time::{Duration, Instant};
 use spider_client::{link::message::{Message, UiMessage, RouterMessage, UiPageManager, DatasetMessage, DatasetPath, DatasetData}, ClientChannel};
 use rppal::gpio::Trigger;
-use chrono::Local;
+use chrono::{Local, NaiveTime};
 use std::collections::HashMap;
 
 pub const PWR_LED_CONFIG: &'static str = "pwr_led";
 pub const BUTTON_LED_CONFIG: &'static str = "button_led";
 pub const TEMP_UNIT_CONFIG_C: &'static str = "temp_unit";
+
+pub const SCHED_START: &'static str = "sched_start";
+pub const SCHED_DURATION: &'static str = "sched_duration";
+pub const SCHED_MAX_WATER: &'static str = "sched_max_water";
 
 pub struct State {
     dataset_path: DatasetPath,
@@ -45,6 +49,10 @@ impl State {
             (String::from(PWR_LED_CONFIG), DatasetData::Byte(1)),
             (String::from(BUTTON_LED_CONFIG), DatasetData::Byte(1)),
             (String::from(TEMP_UNIT_CONFIG_C), DatasetData::Byte(1)),
+
+            (String::from(SCHED_START), DatasetData::String(String::from("00:00"))),
+            (String::from(SCHED_DURATION), DatasetData::Int(0)),
+            (String::from(SCHED_MAX_WATER), DatasetData::Int(0)),
         ]);
         ret.set_config(map).await;
         ret
@@ -86,7 +94,7 @@ impl State {
 
     pub async fn update_ui(&mut self) {
         let changes = self.ui_page.get_changes();
-        println!("Change set: {:?}", changes);
+        //println!("Change set: {:?}", changes);
         if changes.is_empty() {
             return;
         }
@@ -151,18 +159,97 @@ impl State {
         self.rpi_interface.get_pin_event().await
     }
 
+    pub async fn process_schedule(&mut self, duration: Duration) -> Option<()>{
+        // dont start if running.
+        if !self.remaining_time.is_zero(){
+            return None;
+        }
+
+        let duration = duration + duration / 2;
+        // Get current time
+        let current_time = Local::now().time();
+
+        // Check time
+        let DatasetData::String(set_start_time) = self.config.get(&String::from(SCHED_START))? else {return None};
+        let set_time = NaiveTime::parse_from_str(&set_start_time, "%I:%M %P").ok()?;
+        if set_time > current_time || current_time > set_time + duration {
+            return None;
+        }
+
+        // Check moisture
+        let DatasetData::Int(set_moisture) = self.config.get(&String::from(SCHED_MAX_WATER))? else {return None};
+        if *set_moisture != 0 && *set_moisture < (self.rpi_interface.get_water().await).into() {
+            return None;
+        }
+
+        // Add time
+        let DatasetData::Int(duration_mins) = self.config.get(&String::from(SCHED_DURATION))? else {return None};
+        let duration = Duration::from_secs((*duration_mins).try_into().unwrap_or(0u64) * 60);
+        self.increment_time(duration);
+        
+        Some(())
+    }
 
 
-    // This part needs updating
-
+    // Config functions
 
     pub async fn set_config(&mut self, config: HashMap::<String, DatasetData>) {
         self.config = config;
         if let Some(DatasetData::Byte(state)) = self.config.get(&String::from(PWR_LED_CONFIG)) {
             self.set_enable_pwr_led(*state != 0).await;
         }
+        if let Some(DatasetData::Byte(state)) = self.config.get(&String::from(BUTTON_LED_CONFIG)) {
+            self.set_enable_button_led(*state != 0).await;
+        }
+        if let Some(DatasetData::Byte(state)) = self.config.get(&String::from(TEMP_UNIT_CONFIG_C)) {
+            self.set_units_c(*state != 0).await;
+        }
+
+        if let Some(DatasetData::String(text)) = self.config.get(&String::from(SCHED_START)) {
+            if let Ok(time) = NaiveTime::parse_from_str(&text, "%I:%M %P") {
+                self.set_sched_time(time);
+            }
+        }
+        if let Some(DatasetData::Int(duration)) = self.config.get(&String::from(SCHED_DURATION)) {
+            self.set_sched_duration(*duration as u32);
+        }
+        if let Some(DatasetData::Int(water)) = self.config.get(&String::from(SCHED_MAX_WATER)) {
+            self.set_sched_max_water(*water as u32);
+        }
     }
     
+
+    // Schedule Config
+
+    pub fn set_sched_time(&mut self, time: NaiveTime) {
+        let time_str = time.format("%I:%M %P").to_string();
+
+        // update UI
+        let mut element = self.ui_page.get_by_id_mut("start_time").expect("Page should have start time config element");
+        element.set_text(time_str.clone());
+
+        // update config
+        self.config.insert(String::from(SCHED_START), DatasetData::String(time_str));
+    }
+
+    pub fn set_sched_duration(&mut self, duration: u32) {
+        let mut element = self.ui_page.get_by_id_mut("duration").expect("Page should have duration config element");
+        element.set_text(format!("{} mins", duration));
+
+        self.config.insert(String::from(SCHED_DURATION), DatasetData::Int(duration.try_into().unwrap_or(0)));
+    }
+
+    pub fn set_sched_max_water(&mut self, water: u32) {
+        let mut element = self.ui_page.get_by_id_mut("max_water").expect("Page should have max water config element");
+        element.set_text(format!("{}", water));
+
+        self.config.insert(String::from(SCHED_MAX_WATER), DatasetData::Int(water.try_into().unwrap_or(0)));
+    }
+
+
+
+    // Settings Config
+
     pub fn is_units_c(&self) -> bool{
         if let Some(DatasetData::Byte(state)) = self.config.get(&String::from(TEMP_UNIT_CONFIG_C)) {
             *state != 0
@@ -244,7 +331,6 @@ impl State {
         // update config
         self.config.insert(String::from(BUTTON_LED_CONFIG), DatasetData::Byte(if state {1} else {0}));
     }
-
 
     pub async fn save_config(&mut self) {
         let msg = Message::Dataset(DatasetMessage::SetElement{path: self.dataset_path.clone(), data: DatasetData::Map(self.config.clone()), id: 0});

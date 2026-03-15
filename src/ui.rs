@@ -98,6 +98,63 @@ pub fn init_ui(id: SpiderId2048) -> UiPageManager {
         element
     });
 
+    root.append_child({
+        let mut element = UiElement::new(UiElementKind::Columns);
+        element.append_child(UiElement::from_string("Start time:"));
+        element.append_child({
+            let mut element = UiElement::from_string("00:00");
+            element.set_id("start_time");
+            element
+        });
+        element.append_child(UiElement::new(UiElementKind::Spacer));
+        element.append_child({
+            let mut input = UiElement::from_string("Start Time");
+            input.set_kind(UiElementKind::TextEntry);
+            input.set_selectable(true);
+            input.set_id("sched_start_time");
+            input
+        });
+        element
+    });
+
+    root.append_child({
+        let mut element = UiElement::new(UiElementKind::Columns);
+        element.append_child(UiElement::from_string("Duration (min):"));
+        element.append_child({
+            let mut element = UiElement::from_string("0");
+            element.set_id("duration");
+            element
+        });
+        element.append_child(UiElement::new(UiElementKind::Spacer));
+        element.append_child({
+            let mut input = UiElement::from_string("Duration (Min)");
+            input.set_kind(UiElementKind::TextEntry);
+            input.set_selectable(true);
+            input.set_id("sched_duration");
+            input
+        });
+        element
+    });
+
+    root.append_child({
+        let mut element = UiElement::new(UiElementKind::Columns);
+        element.append_child(UiElement::from_string("Max moisture:"));
+        element.append_child({
+            let mut element = UiElement::from_string("0");
+            element.set_id("max_water");
+            element
+        });
+        element.append_child(UiElement::new(UiElementKind::Spacer));
+        element.append_child({
+            let mut input = UiElement::from_string("Max Moisture");
+            input.set_kind(UiElementKind::TextEntry);
+            input.set_selectable(true);
+            input.set_id("sched_max_water");
+            input
+        });
+        element
+    });
+
     // Config Section
     root.append_child({
         let mut element = UiElement::new(UiElementKind::Header);

@@ -12,9 +12,10 @@ use std::{io, path::PathBuf, time::Duration};
 use tokio::time::interval;
 use spider_client::{SpiderClientBuilder, ClientResponse, link::message::{Message, UiMessage, UiInput, DatasetPath, DatasetMessage, DatasetData}};
 use rppal::gpio::Trigger;
+use chrono::NaiveTime;
 
 const TICK_INTERVAL: Duration = Duration::from_secs(10);
-const LONG_PRESS_THRESHOLD: Duration = Duration::from_secs(4);
+const LONG_PRESS_THRESHOLD: Duration = Duration::from_secs(3);
 
 #[tokio::main]
 async fn main() -> Result<(), io::Error> {
@@ -55,11 +56,11 @@ async fn main() -> Result<(), io::Error> {
             },
             // Take probe reading
             _ = interval.tick() => {
-                println!("period: {:?}", interval.period());
                 state.update_page_clock_time();
                 state.update_page_temp().await;
                 state.update_page_water().await;
                 state.decrement_time(interval.period());
+                state.process_schedule(interval.period()).await;
                 state.update_page_timer();
                 state.update_ui().await;
             },
@@ -79,7 +80,7 @@ async fn main() -> Result<(), io::Error> {
                         state.update_ui().await;
                     }else{
                         println!("Incrementing time");
-                        state.increment_time(Duration::from_secs(10));
+                        state.increment_time(Duration::from_mins(5));
                         state.update_page_timer();
                         state.update_ui().await;
                     }
@@ -91,7 +92,7 @@ async fn main() -> Result<(), io::Error> {
     Ok(())
 }
 
-async fn handle_input(state: &mut State, element_id: String, _dataset_ids: Vec<usize>, _change: UiInput){
+async fn handle_input(state: &mut State, element_id: String, _dataset_ids: Vec<usize>, change: UiInput){
     match element_id.as_str() {
         "inc_5_min" => {
             state.increment_time(Duration::from_mins(5));
@@ -114,6 +115,39 @@ async fn handle_input(state: &mut State, element_id: String, _dataset_ids: Vec<u
             state.update_ui().await;
         }
 
+        // Schedule settings
+        "sched_start_time" => {
+            if let UiInput::Text(text) = change {
+                if let Ok(time) = NaiveTime::parse_from_str(&text, "%I:%M %P") {
+                    println!("Setting schedule start time: {}", time);
+                    state.set_sched_time(time);
+                    state.save_config().await;
+                    state.update_ui().await;
+                }
+            }
+        }
+        "sched_duration" => {
+            if let UiInput::Text(text) = change {
+                if let Ok(duration) = text.parse::<u32>() {
+                    println!("Setting shedule duration: {}", duration);
+                    state.set_sched_duration(duration);
+                    state.save_config().await;
+                    state.update_ui().await;
+                }
+            }
+        }
+        "sched_max_water" => {
+            if let UiInput::Text(text) = change {
+                if let Ok(water) = text.parse::<u32>() {
+                    println!("Setting shedule water limit: {}", water);
+                    state.set_sched_max_water(water);
+                    state.save_config().await;
+                    state.update_ui().await;
+                }
+            }
+        }
+
+        // Config settings
         "toggle_pwr_led" => {
             let mut pwr_led = state.is_enable_pwr_led();
             pwr_led = !pwr_led;
