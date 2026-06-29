@@ -23,7 +23,16 @@ async fn main() -> Result<(), io::Error> {
 
     let client_path = PathBuf::from("client_state.dat");
 
+    tracing_subscriber::fmt()
+    .with_env_filter(
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| "warn,sluice=info,spider_client=info".into()),
+    )
+    .init();
+
+
     let mut builder = SpiderClientBuilder::load_or_set(&client_path, |builder| {
+        builder.enable_transport("auth_tcp".to_string());
         builder.enable_beacon(true);
     }).await.expect("Failed to load config");
 

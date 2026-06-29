@@ -6,9 +6,11 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-spider_client = { git = "https://github.com/Ocelmot/spider" }
+spider_client = { git = "https://github.com/Ocelmot/spider", rev = "1d48e74eaac0a447d41c02b3ced2f2e6dca2f925"}
 tokio = { version = "1", features = ["full", "tracing"] }
 serde_json = "1.0.73"
 
 rppal = "0.22.1"
 chrono = "0.4.42"
+
+tracing-subscriber = {version = "0.3.23", features = ["env-filter"]}
